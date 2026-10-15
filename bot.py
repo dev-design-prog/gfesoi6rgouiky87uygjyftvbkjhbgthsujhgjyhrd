@@ -8,7 +8,14 @@ import sqlite3
 import time
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import (
     IS_MEMBER,
     IS_NOT_MEMBER,
@@ -28,10 +35,14 @@ from aiogram.types import (
 # ======================= НАСТРОЙКИ =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8984423334:AAFrUPJ5UumBQDw9OhPjmzMC9sS1Z_lWAeg")
 
+# Админы: по username (без @). Для надёжности можно дополнительно задать ID через ADMIN_IDS (команда /myid).
+ADMIN_USERNAMES = {"vvlzx"}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+
 BASE_DIR = Path(__file__).parent
 CARDS_DIR = BASE_DIR / "cards"
 PHOTOS_DIR = CARDS_DIR / "photos"
-DB_PATH = BASE_DIR / "bot.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "bot.db")))
 
 COOLDOWN_SECONDS = 2 * 60 * 60  # 2 часа
 
@@ -55,6 +66,8 @@ PAGE_SIZE = 8
 # =========================================================
 
 router = Router()
+BOT_USERNAME = ""
+_recent_welcome: dict[int, float] = {}
 
 
 # ----------------------- БАЗА ДАННЫХ -----------------------
@@ -77,6 +90,10 @@ db.executescript(
         card TEXT NOT NULL,
         count INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY (tg_id, card)
+    );
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id INTEGER PRIMARY KEY,
+        title TEXT
     );
     """
 )
@@ -226,6 +243,28 @@ def main_kb() -> InlineKeyboardMarkup:
     )
 
 
+def start_kb() -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(text="🃏 Открыть карточку", callback_data="open"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+    ]]
+    if BOT_USERNAME:
+        rows.insert(0, [InlineKeyboardButton(
+            text="➕ Добавить в группу",
+            url=f"https://t.me/{BOT_USERNAME}?startgroup=welcome",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def welcome_group(bot: Bot, chat_id: int):
+    """Приветствие в группе (с защитой от двойной отправки)."""
+    now = time.time()
+    if now - _recent_welcome.get(chat_id, 0) < 60:
+        return
+    _recent_welcome[chat_id] = now
+    await bot.send_message(chat_id, WELCOME)
+
+
 async def give_card(message: Message, tg_user):
     tg_id = tg_user.id
     cards = load_cards()
@@ -261,8 +300,8 @@ async def give_card(message: Message, tg_user):
         "repeats = repeats + ? WHERE tg_id = ?",
         (gain_points, gain_coins, now, 1 if is_repeat else 0, tg_id),
     )
-    db.commit()
-    user = get_user(tg_id)
+    # пока без commit: если отправка фото упадёт, кулдаун и очки не списываются
+    user = db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
 
     head = (
         f"🔁 Повторка — «{card['name']}»!"
@@ -275,7 +314,14 @@ async def give_card(message: Message, tg_user):
         f"✨ Очки • +{fmt(gain_points)} [{fmt(user['points'])}]\n"
         f"💰 Монеты • +{fmt(gain_coins)} [{fmt(user['coins'])}]"
     )
-    await message.reply_photo(FSInputFile(card["path"]), caption=caption)
+    try:
+        await message.reply_photo(FSInputFile(card["path"]), caption=caption)
+    except Exception:
+        db.rollback()
+        logging.exception("Не удалось отправить карточку «%s»", card["name"])
+        await message.answer("⚠️ Не удалось отправить карточку, попробуй ещё раз. Кулдаун не потрачен.")
+        return
+    db.commit()
 
 
 # ----------------------- ПРОФИЛЬ -----------------------
@@ -297,6 +343,173 @@ async def edit_profile_message(msg: Message, text: str, kb: InlineKeyboardMarkup
         await msg.edit_text(text, reply_markup=kb)
 
 
+
+# ======================= АДМИН-ПАНЕЛЬ =======================
+admin_router = Router()
+admin_router.message.filter(F.chat.type == "private")
+
+
+class Broadcast(StatesGroup):
+    waiting_message = State()
+
+
+def is_admin(user) -> bool:
+    uname = (user.username or "").lower()
+    return uname in {u.lower() for u in ADMIN_USERNAMES} or user.id in ADMIN_IDS
+
+
+def admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📣 Рассылка в группы", callback_data="adm:bc")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="📋 Список групп", callback_data="adm:groups")],
+    ])
+
+
+ADMIN_TEXT = "🛠 Админ-панель\n\nВыбери действие:"
+
+
+@admin_router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Нет доступа.")
+        return
+    await state.clear()
+    await message.answer(ADMIN_TEXT, reply_markup=admin_kb())
+
+
+@admin_router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    if is_admin(message.from_user):
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=admin_kb())
+
+
+@admin_router.callback_query(F.data.startswith("adm:"))
+async def cb_admin(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("⛔ Нет доступа", show_alert=True)
+        return
+    action = call.data.split(":")[1]
+
+    if action == "menu":
+        await state.clear()
+        await call.message.edit_text(ADMIN_TEXT, reply_markup=admin_kb())
+
+    elif action == "stats":
+        users = db.execute("SELECT COUNT(*) c, COALESCE(SUM(opens),0) o FROM users").fetchone()
+        await call.message.edit_text(
+            "📊 Статистика\n\n"
+            f"👥 Игроков: {users['c']}\n"
+            f"🃏 Открыто карточек: {users['o']}\n"
+            f"💬 Групп: {len(_known_chats)}\n"
+            f"🖼 Карточек в базе: {len(load_cards())}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")]]),
+        )
+
+    elif action == "groups":
+        rows = db.execute("SELECT chat_id, title FROM chats ORDER BY title").fetchall()
+        text = "📋 Группы бота:\n\n" + ("\n".join(f"• {r['title']}" for r in rows) if rows else "Пока нет ни одной группы.")
+        await call.message.edit_text(
+            text[:4000],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:menu")]]),
+        )
+
+    elif action == "bc":
+        if not _known_chats:
+            await call.answer("Бот пока не знает ни одной группы. Напишите что-нибудь в группе.", show_alert=True)
+            return
+        await state.set_state(Broadcast.waiting_message)
+        await call.message.edit_text(
+            "📣 Рассылка\n\nОтправь сообщение, которое бот разошлёт в группы "
+            "(текст, фото, видео, голосовое — что угодно).\n\n/cancel — отмена"
+        )
+    await call.answer()
+
+
+@admin_router.message(Broadcast.waiting_message)
+async def bc_got_message(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    if message.text and message.text.startswith("/"):
+        return
+    await state.update_data(src_chat=message.chat.id, src_msg=message.message_id)
+    await message.answer("👆 Так будет выглядеть сообщение. Куда отправить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Во все группы ({len(_known_chats)})", callback_data="bc:all")],
+        [InlineKeyboardButton(text="🎯 В одну группу", callback_data="bc:pick:0")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:menu")],
+    ]), reply_to_message_id=message.message_id)
+
+
+async def send_to_chats(bot: Bot, chat_ids: list[int], src_chat: int, src_msg: int) -> tuple[int, int]:
+    ok = failed = 0
+    for cid in chat_ids:
+        for _ in range(3):
+            try:
+                await bot.copy_message(cid, src_chat, src_msg)
+                ok += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                failed += 1
+                unregister_chat(cid)  # бота выгнали / группа удалена
+                break
+            except Exception:
+                logging.exception("Ошибка рассылки в %s", cid)
+                failed += 1
+                break
+        await asyncio.sleep(0.05)
+    return ok, failed
+
+
+@admin_router.callback_query(F.data.startswith("bc:"))
+async def cb_broadcast(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("⛔ Нет доступа", show_alert=True)
+        return
+    data = await state.get_data()
+    if "src_msg" not in data:
+        await call.answer("Сообщение не найдено, начни заново: /admin", show_alert=True)
+        return
+    parts = call.data.split(":")
+    action = parts[1]
+
+    if action == "pick":
+        page = int(parts[2])
+        rows = db.execute("SELECT chat_id, title FROM chats ORDER BY title").fetchall()
+        pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        kb = [[InlineKeyboardButton(text=r["title"][:40], callback_data=f"bc:g:{r['chat_id']}")]
+              for r in rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"bc:pick:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bc:pick:{page + 1}"))
+        kb.append(nav)
+        kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:menu")])
+        await call.message.edit_text("Выбери группу:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await call.answer()
+        return
+
+    if action == "all":
+        targets = list(_known_chats)
+    else:  # bc:g:<chat_id>
+        targets = [int(parts[2])]
+
+    await call.message.edit_text(f"⏳ Отправляю в {len(targets)} гр...")
+    ok, failed = await send_to_chats(call.bot, targets, data["src_chat"], data["src_msg"])
+    await state.clear()
+    await call.message.edit_text(
+        f"✅ Рассылка завершена\n\nОтправлено: {ok}\nНе удалось: {failed}"
+        + ("\n(группы, где бота нет, удалены из списка)" if failed else ""),
+        reply_markup=admin_kb(),
+    )
+    await call.answer()
+
+
 # ----------------------- ХЕНДЛЕРЫ -----------------------
 WELCOME = (
     "👋 Всем привет! Я бот, в котором ты можешь собирать уникальные карточки "
@@ -316,20 +529,72 @@ HELP = (
 )
 
 
+_known_chats: set[int] = {r["chat_id"] for r in db.execute("SELECT chat_id FROM chats")}
+
+
+def register_chat(chat_id: int, title: str | None):
+    if chat_id in _known_chats:
+        return
+    _known_chats.add(chat_id)
+    db.execute("INSERT OR REPLACE INTO chats (chat_id, title) VALUES (?, ?)", (chat_id, title or str(chat_id)))
+    db.commit()
+
+
+def unregister_chat(chat_id: int):
+    _known_chats.discard(chat_id)
+    db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+    db.commit()
+
+
+class ChatTracker(BaseMiddleware):
+    """Запоминает группы, в которых кто-то писал (для рассылки)."""
+
+    async def __call__(self, handler, event, data):
+        if event.chat.type in ("group", "supergroup"):
+            register_chat(event.chat.id, event.chat.title)
+        return await handler(event, data)
+
+
+router.message.outer_middleware(ChatTracker())
+
+
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_NOT_MEMBER >> IS_MEMBER))
 async def bot_added(event: ChatMemberUpdated):
     if event.chat.type in ("group", "supergroup"):
-        await event.bot.send_message(event.chat.id, WELCOME)
+        register_chat(event.chat.id, event.chat.title)
+        await welcome_group(event.bot, event.chat.id)
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=IS_MEMBER >> IS_NOT_MEMBER))
+async def bot_removed(event: ChatMemberUpdated):
+    if event.chat.type in ("group", "supergroup"):
+        unregister_chat(event.chat.id)
+
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.answer(f"Твой Telegram ID: {message.from_user.id}")
+
+
+@router.message(F.new_chat_members)
+async def on_new_members(message: Message):
+    me = await message.bot.me()
+    if any(u.id == me.id for u in message.new_chat_members):
+        await welcome_group(message.bot, message.chat.id)
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(WELCOME, reply_markup=main_kb())
+    if message.chat.type == "private":
+        await message.answer(WELCOME, reply_markup=start_kb())
+    else:
+        # сюда попадаем после кнопки «Добавить в группу» (startgroup)
+        await welcome_group(message.bot, message.chat.id)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(HELP, reply_markup=main_kb())
+    await message.answer(HELP, reply_markup=start_kb())
 
 
 @router.message(Command("card"))
@@ -441,8 +706,18 @@ async def on_text(message: Message):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    global BOT_USERNAME
     bot = Bot(BOT_TOKEN)
+    BOT_USERNAME = (await bot.me()).username
+    me = await bot.get_me()
+    if not me.can_read_all_group_messages:
+        logging.warning(
+            "У бота ВКЛЮЧЁН Group Privacy: в группах он не видит обычные сообщения («спейс»). "
+            "Выключи в @BotFather (Bot Settings -> Group Privacy -> Turn off), затем удали бота из группы "
+            "и добавь заново, либо сделай бота админом группы."
+        )
     dp = Dispatcher()
+    dp.include_router(admin_router)  # админка — первой, чтобы FSM-сообщения не ловил общий обработчик
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
