@@ -44,7 +44,7 @@ CARDS_DIR = BASE_DIR / "cards"
 PHOTOS_DIR = CARDS_DIR / "photos"
 DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "bot.db")))
 
-COOLDOWN_SECONDS = 2 * 60 * 60  # 2 часа
+COOLDOWN_SECONDS = 1 * 60 * 60  # 1 час
 
 # Слова-триггеры (регистр и знаки препинания не важны)
 TRIGGERS = {"спейс", "карточка спейс", "карта спейс"}
@@ -132,9 +132,14 @@ def card_id(name: str) -> str:
     return hashlib.md5(name.encode()).hexdigest()[:10]
 
 
-def pick_card(cards: dict[str, dict]) -> dict:
+_last_drop: dict[int, str] = {}  # chat_id -> карточка, выпавшая последней в этом чате
+
+
+def pick_card(cards: dict[str, dict], exclude: str | None = None) -> dict:
+    """Случайная карточка. exclude — название, которое не должно выпасть (если есть выбор)."""
+    pool = {n: c for n, c in cards.items() if n != exclude} or cards
     by_rarity: dict[str, list] = {}
-    for c in cards.values():
+    for c in pool.values():
         by_rarity.setdefault(c["rarity"], []).append(c)
     keys = list(by_rarity)
     weights = [RARITIES[k]["weight"] for k in keys]
@@ -279,7 +284,8 @@ async def give_card(message: Message, tg_user):
         await message.reply(f"⏳ Следующую карточку можно открыть через {fmt_time(left)}")
         return
 
-    card = pick_card(cards)
+    # не выдаём подряд одну и ту же карточку разным людям в одном чате
+    card = pick_card(cards, exclude=_last_drop.get(message.chat.id))
     r = RARITIES[card["rarity"]]
     row = db.execute(
         "SELECT count FROM user_cards WHERE tg_id = ? AND card = ?", (tg_id, card["name"])
@@ -322,6 +328,7 @@ async def give_card(message: Message, tg_user):
         await message.answer("⚠️ Не удалось отправить карточку, попробуй ещё раз. Кулдаун не потрачен.")
         return
     db.commit()
+    _last_drop[message.chat.id] = card["name"]
 
 
 # ----------------------- ПРОФИЛЬ -----------------------
@@ -524,7 +531,7 @@ HELP = (
     "🃏 /card — открыть новую карточку (или напиши «спейс»)\n"
     "👤 /profile — посмотреть свой профиль\n"
     "❓ /help — список команд\n\n"
-    "⏳ Карточку можно открывать раз в 2 часа.\n"
+    "⏳ Карточку можно открывать раз в час.\n"
     "♻️ За повторную карточку очков меньше."
 )
 
