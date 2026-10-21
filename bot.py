@@ -61,6 +61,10 @@ RARITIES = {
 REPEAT_POINTS_PERCENT = 20
 REPEAT_COINS = 1
 
+# Шанс (в %), что выпадет НОВАЯ для игрока карточка, пока у него есть неоткрытые.
+# Чем больше число, тем реже повторки. 100 — повторок не будет, пока не откроет все.
+NEW_CARD_CHANCE = 85
+
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 PAGE_SIZE = 8
 # =========================================================
@@ -135,16 +139,32 @@ def card_id(name: str) -> str:
 _last_drop: dict[int, str] = {}  # chat_id -> карточка, выпавшая последней в этом чате
 
 
-def pick_card(cards: dict[str, dict], exclude: str | None = None) -> dict:
-    """Случайная карточка. exclude — название, которое не должно выпасть (если есть выбор)."""
-    pool = {n: c for n, c in cards.items() if n != exclude} or cards
+def _weighted_pick(pool: list[dict]) -> dict:
+    """Выбор из списка карточек: сначала редкость по весам, потом случайная карточка этой редкости."""
     by_rarity: dict[str, list] = {}
-    for c in pool.values():
+    for c in pool:
         by_rarity.setdefault(c["rarity"], []).append(c)
     keys = list(by_rarity)
     weights = [RARITIES[k]["weight"] for k in keys]
     key = random.choices(keys, weights=weights)[0]
     return random.choice(by_rarity[key])
+
+
+def pick_card(cards: dict[str, dict], exclude: str | None = None, owned: set[str] | None = None) -> dict:
+    """Случайная карточка.
+    exclude — название, которое не должно выпасть (если есть выбор).
+    owned — карточки, которые уже есть у игрока: новые выпадают с шансом NEW_CARD_CHANCE %.
+    """
+    owned = owned or set()
+    pool = {n: c for n, c in cards.items() if n != exclude} or cards
+    new = [c for n, c in pool.items() if n not in owned]
+    old = [c for n, c in pool.items() if n in owned]
+
+    if new and old:
+        group = new if random.random() * 100 < NEW_CARD_CHANCE else old
+    else:
+        group = new or old
+    return _weighted_pick(group)
 
 
 def fmt(n: int) -> str:
@@ -285,7 +305,8 @@ async def give_card(message: Message, tg_user):
         return
 
     # не выдаём подряд одну и ту же карточку разным людям в одном чате
-    card = pick_card(cards, exclude=_last_drop.get(message.chat.id))
+    owned = {r["card"] for r in db.execute("SELECT card FROM user_cards WHERE tg_id = ?", (tg_id,))}
+    card = pick_card(cards, exclude=_last_drop.get(message.chat.id), owned=owned)
     r = RARITIES[card["rarity"]]
     row = db.execute(
         "SELECT count FROM user_cards WHERE tg_id = ? AND card = ?", (tg_id, card["name"])
